@@ -473,7 +473,16 @@ def main():
             avg_stage1_price = sum(bid for _, bid in accepted_stage1) / stage1_units
             st.write(f"**Average price paid:** ${avg_stage1_price:.2f}")
             st.write(f"**vs Face price:** {avg_stage1_price/face_price:.2%}")
-    
+
+    # --- NEW: Show all Stage 1 bids and acceptance status as a table ---
+    st.markdown("#### Stage 1: All Bids and Acceptance Status")
+    accepted_ids = {cid for cid, _ in accepted_stage1}
+    stage1_tbl = []
+    for cid, bid in bids:
+        status = "Accepted" if cid in accepted_ids else "Rejected"
+        stage1_tbl.append({"Customer": cid, "Bid": f"${bid:.2f}", "Status": status})
+    st.dataframe(pd.DataFrame(stage1_tbl))
+
     # Stage 2 Analysis
     st.markdown('<div class="stage-header">🎨 Stage 2: Personalized Pricing</div>', unsafe_allow_html=True)
     
@@ -503,21 +512,21 @@ def main():
                 prices_list = [price_dict[cid] for cid, _ in remaining]
                 st.write(f"**Price range:** ${min(prices_list):.2f} - ${max(prices_list):.2f}")
 
-        # ---------------- Detailed price table -----------------
-        with st.expander("🔍 Show per-customer prices (Stage 2)"):
-            tbl = []
-            for cid, bid in remaining:
-                P_i = price_dict[cid]
-                if P_i <= bid:
-                    prob = 1.0
-                elif P_i <= 2 * bid:
-                    prob = ((2 * bid - P_i) / bid) ** 2
-                else:
-                    prob = 0.0
-                status = f"Prob={prob:.2f}"
-                tbl.append({"Customer": cid, "Bid": f"${bid:.2f}", "Price": f"${P_i:.2f}", "Acceptance": status})
-
-            st.dataframe(pd.DataFrame(tbl))
+        # --- NEW: Show all Stage 2 bids, prices, and acceptance probabilities as a visible table ---
+        st.markdown("#### Stage 2: All Bids, Personalized Prices, and Acceptance Probabilities")
+        tbl = []
+        price_dict = {cid: p for cid, p in prices_stage2}
+        for cid, bid in remaining:
+            P_i = price_dict[cid]
+            if P_i <= bid:
+                prob = 1.0
+            elif P_i <= 2 * bid:
+                prob = ((2 * bid - P_i) / bid) ** 2
+            else:
+                prob = 0.0
+            status = f"Prob={prob:.2f}"
+            tbl.append({"Customer": cid, "Bid": f"${bid:.2f}", "Price": f"${P_i:.2f}", "Acceptance Probability": status})
+        st.dataframe(pd.DataFrame(tbl))
     else:
         if inventory_left <= 0:
             st.info("📦 All inventory was already sold in Stage 1.")

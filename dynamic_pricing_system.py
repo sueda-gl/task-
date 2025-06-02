@@ -2,6 +2,24 @@ import numpy as np
 import pulp  # open-source MILP solver (CBC bundled)
 from typing import List, Tuple, Dict
 import bisect
+import sys
+import os
+import shutil
+
+# --- PyInstaller PuLP CBC Solver Path Fix ---
+CBC_SOLVER = None
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    # Always use system CBC in PyInstaller mode
+    system_cbc = shutil.which('cbc')
+    if system_cbc:
+        print(f"INFO: PyInstaller mode - Using system CBC at: {system_cbc}")
+        CBC_SOLVER = pulp.PULP_CBC_CMD(path=system_cbc, msg=False)
+    else:
+        print("WARNING: System-wide CBC not found. PuLP will error if called.")
+        CBC_SOLVER = pulp.PULP_CBC_CMD(msg=False)
+else:
+    CBC_SOLVER = pulp.PULP_CBC_CMD(msg=False)
+# --- End PyInstaller PuLP CBC Solver Path Fix ---
 
 def stage1_allocation(bids: List[Tuple[int, float]], P: float, N: int) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]], int, float]:
     """
@@ -113,7 +131,7 @@ def deterministic_stage2(
         # floor would make the problem mathematically infeasible.
         model += Pvars[cid] >= 0.0 * y[cid]
 
-    status = model.solve(pulp.PULP_CBC_CMD(msg=False))
+    status = model.solve(CBC_SOLVER)
 
     # ------------------------------------------------------------------
     # If exact revenue balance is impossible, try a *relaxed* model that
@@ -143,7 +161,7 @@ def deterministic_stage2(
                 model_units += P_u[cid] <= B * y_u[cid]
                 model_units += P_u[cid] >= 0.0 * y_u[cid]
 
-            status_u = model_units.solve(pulp.PULP_CBC_CMD(msg=False))
+            status_u = model_units.solve(CBC_SOLVER)
 
             if status_u != pulp.LpStatusOptimal:
                 print("  MILP infeasible in unit-max phase — reverting to prohibitive pricing.")
@@ -179,7 +197,7 @@ def deterministic_stage2(
                 model_gap += P_g[cid] <= B * y_g[cid]
                 model_gap += P_g[cid] >= 0.0 * y_g[cid]
 
-            status_g = model_gap.solve(pulp.PULP_CBC_CMD(msg=False))
+            status_g = model_gap.solve(CBC_SOLVER)
 
             if status_g == pulp.LpStatusOptimal:
                 prices = []
@@ -213,7 +231,7 @@ def deterministic_stage2(
             model_gap1 += P_g1[cid] <= B * y_g1[cid]
             model_gap1 += P_g1[cid] >= 0.0 * y_g1[cid]
 
-        status_g1 = model_gap1.solve(pulp.PULP_CBC_CMD(msg=False))
+        status_g1 = model_gap1.solve(CBC_SOLVER)
 
         if status_g1 != pulp.LpStatusOptimal:
             print("  GAP-first phase1 infeasible — reverting to prohibitive pricing.")
@@ -241,7 +259,7 @@ def deterministic_stage2(
             model_units2 += P2v[cid] <= B * y2[cid]
             model_units2 += P2v[cid] >= 0.0 * y2[cid]
 
-        status_u2 = model_units2.solve(pulp.PULP_CBC_CMD(msg=False))
+        status_u2 = model_units2.solve(CBC_SOLVER)
 
         if status_u2 == pulp.LpStatusOptimal:
             prices = []
