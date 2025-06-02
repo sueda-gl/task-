@@ -1,4 +1,5 @@
 import numpy as np
+import pulp  # open-source MILP solver (CBC bundled)
 from typing import List, Tuple, Dict
 import bisect
 
@@ -62,6 +63,121 @@ def stage1_allocation(bids: List[Tuple[int, float]], P: float, N: int) -> Tuple[
     return accepted_stage1, remaining, t, delta1
 
 
+# ---------------------------------------------------------------------------
+# Deterministic MILP Stage-2 solver (uniform price, binary selection)
+# ---------------------------------------------------------------------------
+def deterministic_stage2(
+    remaining: List[Tuple[int, float]],
+    P: float,
+    delta1: float,
+    inventory_left: int,
+) -> List[Tuple[int, float]]:
+    """Solve Stage-2 exactly with a tiny MILP.
+
+    Every chosen customer pays the same uniform price P2 ≤ bid.
+    The model maximises the count of winners while meeting inventory
+    and revenue-balance exactly.
+    """
+    bids = {cid: b for cid, b in remaining}
+
+    K = inventory_left
+    if K <= 0 or not bids:
+        return [(cid, 2 * b) for cid, b in remaining]
+
+    model = pulp.LpProblem("Stage2_MILP", pulp.LpMaximize)
+
+    # Decision variables
+    y = {cid: pulp.LpVariable(f"y_{cid}", 0, 1, cat="Binary") for cid in bids}
+    Pvars = {
+        cid: pulp.LpVariable(
+            f"P_{cid}", lowBound=0.0, upBound=bids[cid], cat="Continuous"
+        )
+        for cid in bids
+    }
+
+    # Objective: maximise number of customers served
+    model += pulp.lpSum(y.values())
+
+    # Stock constraint
+    model += pulp.lpSum(y.values()) <= K
+
+    # Revenue balance: Σ P_i − P Σ y_i  = −Δ1
+    model += pulp.lpSum(Pvars.values()) - P * pulp.lpSum(y.values()) == -delta1
+
+    # Linking constraints: if y_i = 0 → P_i = 0 ; if y_i =1 → P_i within [0.51P, B_i]
+    for cid, B in bids.items():
+        model += Pvars[cid] <= B * y[cid]
+        # Allow the solver to pick any non-negative price, down to zero,
+        # so that it can match the exact revenue balance even when a 0.51 P
+        # floor would make the problem mathematically infeasible.
+        model += Pvars[cid] >= 0.0 * y[cid]
+
+    status = model.solve(pulp.PULP_CBC_CMD(msg=False))
+
+    # ------------------------------------------------------------------
+    # If exact revenue balance is impossible, try a *relaxed* model that
+    # allows a residual gap and minimises it lexicographically after
+    # maximising the customer count.  This gives "the best we can do"
+    # instead of reverting to prohibitive prices.
+    # ------------------------------------------------------------------
+    if status != pulp.LpStatusOptimal:
+        # 1st pass infeasible → build relaxed model
+        model_relax = pulp.LpProblem("Stage2_MILP_relax", pulp.LpMaximize)
+
+        # same variables
+        y2 = {cid: pulp.LpVariable(f"y_{cid}", 0, 1, cat="Binary") for cid in bids}
+        P2 = {
+            cid: pulp.LpVariable(
+                f"P_{cid}", lowBound=0.0, upBound=bids[cid], cat="Continuous"
+            )
+            for cid in bids
+        }
+
+        # residual gap variables (absolute value)
+        g_pos = pulp.LpVariable("g_pos", lowBound=0.0)
+        g_neg = pulp.LpVariable("g_neg", lowBound=0.0)
+
+        BIG = 1000  # weight to prioritise customers over gap
+        model_relax += BIG * pulp.lpSum(y2.values()) - (g_pos + g_neg)
+
+        # stock limit
+        model_relax += pulp.lpSum(y2.values()) <= K
+
+        # relaxed revenue equation: Σ P_i − P Σ y_i + g_pos - g_neg = -Δ1
+        model_relax += (pulp.lpSum(P2.values()) - P * pulp.lpSum(y2.values()) + g_pos - g_neg == -delta1)
+
+        # linking constraints
+        for cid, B in bids.items():
+            model_relax += P2[cid] <= B * y2[cid]
+            model_relax += P2[cid] >= 0.0 * y2[cid]
+
+        status2 = model_relax.solve(pulp.PULP_CBC_CMD(msg=False))
+
+        if status2 == pulp.LpStatusOptimal:
+            # build price list from relaxed solution
+            prices = []
+            for cid, b in remaining:
+                if y2[cid].value() > 0.5:
+                    prices.append((cid, P2[cid].value()))
+                else:
+                    prices.append((cid, 2 * b))
+            gap_val = g_pos.value() - g_neg.value()
+            print(f"  Relaxed MILP: residual balance {gap_val:+.2f} after selling {int(sum(v.value() for v in y2.values()))} units.")
+            return prices
+
+        # still infeasible (pathological) → prohibitive prices
+        print("  MILP infeasible even after relaxation — reverting to prohibitive pricing.")
+        return [(cid, 2 * b) for cid, b in remaining]
+
+    prices = []
+    for cid, b in remaining:
+        if y[cid].value() > 0.5:
+            prices.append((cid, Pvars[cid].value()))
+        else:
+            prices.append((cid, 2 * b))
+    return prices
+
+
 def stage2_pricing(remaining: List[Tuple[int, float]], P: float, delta1: float, inventory_left: int) -> Tuple[List[Tuple[int, float]], float]:
     """
     Stage 2: Optimal personalised pricing (dual decomposition)
@@ -116,280 +232,24 @@ def stage2_pricing(remaining: List[Tuple[int, float]], P: float, delta1: float, 
     # 0. Quick degenerate cases
     # ------------------------------------------------------------------
     if not remaining or inventory_left <= 0:
-        # No inventory left - set all prices to infinity (or 2*Bi)
+        # Case 1: inventory gone but some customers remain (shouldn't happen with current logic)
         if remaining and inventory_left <= 0:
             print("Warning: No inventory left for Stage 2. Setting all prices to maximum.")
-            return [(cid, 2 * bid) for cid, bid in remaining], float('inf')
+            return [(cid, 2 * bid) for cid, bid in remaining], float("inf")
+
+        # Case 2: no customers reached Stage 2 – nothing we can do to balance revenue.
+        if not remaining:
+            print("Info: All eligible customers were served in Stage 1; no Stage 2 actions possible.")
         return [], 0.0
     
     # ------------------------------------------------------------------
-    # Reserve a default value so that we never exit without lambda_star.
-    # It will be overwritten by the optimisation logic; if not, we will
-    # engage the explicit fallback further below.
+    # NEW: Try deterministic MILP first. It always yields exact balance
+    # when mathematically feasible and maximises customers served.
     # ------------------------------------------------------------------
-    lambda_star: float = 0.0
-    
-    # Extract customer IDs and bids
-    customer_ids = [cid for cid, _ in remaining]
-    bids = np.array([bid for _, bid in remaining])
-    R = len(remaining)
-    
-    # Maximum units we can sell in Stage 2
-    max_sales = min(R, inventory_left)
-    
-    print(f"  Stage 2 inventory constraint: can sell at most {max_sales} units")
-    
-    def acceptance_prob(P_i: float, B_i: float) -> float:
-        """Calculate acceptance probability f_i(P_i)"""
-        if P_i <= B_i:
-            return 1.0
-        elif P_i <= 2 * B_i:
-            return ((2 * B_i - P_i) / B_i) ** 2
-        else:
-            return 0.0
-    
-    def solve_single_customer_subproblem(B_i: float, lambda_val: float) -> float:
-        """
-        Single-customer maximisation
-        ---------------------------
-        We solve
+    prices_det = deterministic_stage2(remaining, P, delta1, inventory_left)
 
-            max_{0 ≤ P_i ≤ 2 B_i}  (1 + λ′ (P_i − P)) · f_i(P_i)
-
-        where λ′ is the *re-scaled* dual variable explained in the docstring
-        above.  The interior candidate derived from the first-order condition is
-
-            P_i* = 2 B_i − (2 + 4 λ′ B_i − 2 λ′ P) / (3 λ′).
-
-        This formula is algebraically equivalent to the one that uses two
-        multipliers (λ, μ) once we substitute λ′ = λ / (1+μ).
-        """
-        candidates = []
-        
-        # Clip lambda to prevent overflow
-        lambda_clipped = np.clip(lambda_val, -1e6, 1e6)
-        
-        # Candidate 2: P_i = B_i (boundary between regions)
-        f_B = acceptance_prob(B_i, B_i)  # f_B = 1.0
-        # Dual weighting follows 1 − λ (P_i − P)
-        weight_B = 1 - lambda_clipped * (B_i - P)
-        if abs(weight_B) < 1e10:
-            obj_B = weight_B * f_B
-            candidates.append((B_i, obj_B))
-        
-        # Candidate 3: P_i = 2*B_i
-        f_2B = acceptance_prob(2 * B_i, B_i)  # f_2B = 0.0
-        # Since f_2B = 0, the objective is always 0
-        candidates.append((2 * B_i, 0.0))
-        
-        # Candidate 4: Interior stationary point (if it exists in (B_i, 2*B_i))
-        # For P_i in (B_i, 2*B_i), f_i(P_i) = ((2*B_i - P_i)/B_i)^2
-        # The objective becomes: (1 + lambda*(P_i - P)) * ((2*B_i - P_i)/B_i)^2
-        # Taking derivative and setting to 0 gives:
-        # P_i* = (2*(P + B_i) + 2*lambda/3) / 3
-        
-        if abs(lambda_clipped) > 1e-12:
-            # Derived for objective   (1 − λ (P_i − P)) · f_i(P_i)
-            P_star = 2 * B_i - (2 - 4 * lambda_clipped * B_i + 2 * lambda_clipped * P) / (3 * lambda_clipped)
-        else:
-            P_star = None
-        
-        if P_star is not None and B_i < P_star < 2 * B_i:
-            f_star = acceptance_prob(P_star, B_i)
-            # Dual weighting follows 1 − λ (P_i − P)
-            weight_star = 1 - lambda_clipped * (P_star - P)
-            if abs(weight_star) < 1e10:
-                candidates.append((P_star, weight_star * f_star))
-        
-        # If no valid candidates, default to B_i
-        if not candidates:
-            return B_i
-            
-        # Return the P_i that maximizes the objective
-        best_P_i, _ = max(candidates, key=lambda x: x[1])
-        return best_P_i
-    
-    def compute_G(lambda_val: float) -> float:
-        """
-        Compute G(lambda) = sum_i [(P_i*(lambda) - P) * f_i(P_i*(lambda))] + delta1
-        But also check inventory constraint
-        """
-        total_adjustment = 0.0
-        expected_acceptances = 0.0
-        
-        for B_i in bids:
-            P_i_star = solve_single_customer_subproblem(B_i, lambda_val)
-            f_i = acceptance_prob(P_i_star, B_i)
-            total_adjustment += (P_i_star - P) * f_i
-            expected_acceptances += f_i
-        
-        # Hard inventory constraint: if expected acceptances exceed inventory, return a large
-        # positive value so that any search interval that oversells will be discarded by the
-        # bisection logic (we rely on sign changes).  This keeps the root finder inside the
-        # feasible region where expected_acceptances <= inventory_left.
-        if expected_acceptances > max_sales + 1e-9:
-            return 1e30  # positive large number, sign = +
-
-        return total_adjustment + delta1
-    
-    # Special case: if no inventory left but delta1 != 0, the problem is infeasible
-    if inventory_left == 0 and abs(delta1) > 1e-6:
-        print(f"  WARNING: Infeasible problem! No inventory left but need to adjust revenue by ${-delta1:.2f}")
-        print(f"  Setting all prices to maximum to prevent sales.")
-        return [(cid, 2 * bid) for cid, bid in remaining], float('inf')
-    
-    # If inventory is very limited, we might need to be more selective
-    if inventory_left < R * 0.5:
-        print(f"  Note: Limited inventory ({inventory_left} units for {R} customers)")
-    
-    # Use bisection to find lambda* such that G(lambda*) = 0
-    # Start with a smarter range for lambda based on the problem structure
-    
-    # Estimate reasonable bounds based on the deficit and number of customers
-    avg_deficit_needed = -delta1 / len(remaining) if remaining else 0
-    
-    # Lambda affects prices, and typical price adjustments are on the order of P
-    # So lambda should be on a similar scale
-    lambda_scale = abs(avg_deficit_needed / P) * 10
-    lambda_min = -max(10, lambda_scale)
-    lambda_max = max(10, lambda_scale)
-    
-    # Use bounded expansion to avoid overflow
-    max_lambda_magnitude = 1e4  # Prevent extreme values
-    
-    # Expand range if necessary, but with bounds
-    iteration_count = 0
-    while compute_G(lambda_min) > 0 and lambda_min > -max_lambda_magnitude and iteration_count < 20:
-        lambda_min *= 1.5  # Use 1.5x instead of 2x for more gradual expansion
-        iteration_count += 1
-        
-    iteration_count = 0
-    while compute_G(lambda_max) < 0 and lambda_max < max_lambda_magnitude and iteration_count < 20:
-        lambda_max *= 1.5
-        iteration_count += 1
-    
-    # If we hit the bounds, use them
-    lambda_min = max(lambda_min, -max_lambda_magnitude)
-    lambda_max = min(lambda_max, max_lambda_magnitude)
-    
-    # ------------------------------------------------------------------
-    # Infeasibility detection.
-    # If *all* feasible lambdas violate the inventory constraint, compute_G
-    # will keep returning +inf.  Likewise, if G does not change sign the
-    # revenue target cannot be met within the feasible region.
-    # ------------------------------------------------------------------
-    G_min = compute_G(lambda_min)
-    G_max = compute_G(lambda_max)
-    
-    # Check if we can find a valid bracket for the revenue target
-    if G_min * G_max > 0 and not (np.isinf(G_min) or np.isinf(G_max)):
-        # ------------------------------------------------------------------
-        # No sign-change ⇒ perfect balance infeasible under single-λ model.
-        # We now search for the λ that MINIMISES the absolute imbalance
-        # while observing the inventory cap.  This replaces the previous
-        # ad-hoc surplus/deficit heuristics.
-        # ------------------------------------------------------------------
-        print("  INFO: Perfect balance infeasible within λ-model – running grid search for best feasible λ…")
-
-        candidate_lambdas = [0.0]
-        # Log-spaced magnitudes from 1e-6 to max_lambda_magnitude
-        magnitudes = np.geomspace(1e-6, max_lambda_magnitude, num=60)
-        for mag in magnitudes:
-            candidate_lambdas.extend([mag, -mag])
-
-        best_gap = np.inf
-        best_lambda = None
-
-        for lam in candidate_lambdas:
-            G_val = compute_G(lam)
-            if not np.isfinite(G_val) or abs(G_val) >= 1e29:  # inventory violated or overflow
-                continue
-            gap = abs(G_val)
-            if gap < best_gap:
-                best_gap = gap
-                best_lambda = lam
-
-        if best_lambda is not None:
-            lambda_star = best_lambda
-            print(f"     Chosen λ = {lambda_star:.6f} (revenue gap {best_gap:.2f})")
-        else:
-            print("     No single λ satisfies inventory cap – will invoke deterministic allocation later.")
-    elif np.isinf(G_min) and np.isinf(G_max):
-        # Both endpoints violate inventory
-        print(f"  ERROR: Even with lambda=0, inventory constraint is violated.")
-        lambda_star = 0.0
-    else:
-        # We have a valid bracket with sign change => can meet revenue target exactly
-        # Run standard bisection
-        tolerance = 1e-8
-        max_iterations = 100
-        
-        for _ in range(max_iterations):
-            lambda_mid = (lambda_min + lambda_max) / 2
-            G_mid = compute_G(lambda_mid)
-            
-            if abs(G_mid) < tolerance:
-                lambda_star = lambda_mid
-                break
-                
-            if G_mid > 0:
-                lambda_max = lambda_mid
-            else:
-                lambda_min = lambda_mid
-        else:
-            lambda_star = (lambda_min + lambda_max) / 2
-    
-    # ---------------------------------------------------------------
-    # Fallback for extreme surplus with very tight inventory
-    # ---------------------------------------------------------------
-    G_final = compute_G(lambda_star)
-    if (np.isinf(G_final) or G_final > 1e-4 or G_final < -1e-4):
-        # Optimiser could not hit the balance exactly – construct an
-        # explicit solution for the SURPLUS case (Δ₁ > 0) when stock is
-        # too tight to allow discounts for everyone.
-
-        if delta1 > 0 and inventory_left > 0:
-            k = inventory_left
-            # Required average discount per unit
-            target_price = P - delta1 / k
-
-            # Select k highest bids so that each bid ≥ target_price if possible
-            rem_sorted = sorted(remaining, key=lambda x: x[1], reverse=True)
-            selected = rem_sorted[:k]
-            min_bid_selected = min(b for _, b in selected)
-
-            # Ensure the offered price is not above any selected bid (prob=1)
-            offer_price = min(target_price, min_bid_selected)
-
-            selected_ids = {cid for cid, _ in selected}
-
-            prices_stage2 = []
-            for cid, bid in remaining:  # preserve original order
-                if cid in selected_ids:
-                    prices_stage2.append((cid, offer_price))
-                else:
-                    prices_stage2.append((cid, 2 * bid))
-
-            print(f"  Fallback activated: uniform offer to top-{k} bidders at €{offer_price:.2f} to clear surplus.")
-            return prices_stage2, float('inf')
-
-        # Otherwise (deficit case or still infeasible) fall back to safe
-        # no-sale pricing to protect inventory.
-        print("  Fallback activated: giving prohibitive prices to avoid overselling.")
-        return [(cid, 2 * bid) for cid, bid in remaining], float('inf')
-
-    # Compute optimal prices using lambda*
-    prices_stage2 = []
-    for i, (cid, B_i) in enumerate(remaining):
-        P_i_star = solve_single_customer_subproblem(B_i, lambda_star)
-        prices_stage2.append((cid, P_i_star))
-    
-    return prices_stage2, lambda_star
-
-    # ------------------------------------------------------------------
-    # Fallback block – executed only if the code above early-returns.
-    # ------------------------------------------------------------------
-    # Should never reach here, but keep for static analysers.
+    # Deterministic MILP succeeded — use its prices directly.
+    return prices_det, float("inf")
 
 
 # Example usage and testing

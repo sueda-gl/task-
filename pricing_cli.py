@@ -113,6 +113,38 @@ def main(argv: List[str] | None = None) -> None:
 
     inventory_left = N - t
 
+    # ------------------------------------------------------------------
+    # If Stage 1 has already exhausted the stock we can stop here: the
+    # MILP would be void and Stage 2 cannot adjust revenue anyway.
+    # ------------------------------------------------------------------
+    if inventory_left <= 0:
+        print("No inventory left after Stage 1. All units were sold in Stage 1.")
+
+        T_exp = float(t)  # deterministic — all 100 % of Stage-1 acceptances
+        prop_customers = T_exp / C if C else 0.0
+        prop_inventory = T_exp / N if N else 0.0
+        target_revenue = P * T_exp
+        vendor_revenue_exp = sum(b for _, b in accepted_stage1)
+        remaining_balance = vendor_revenue_exp - target_revenue
+
+        print("===== SUMMARY =====")
+        print(f"T/C (customers served): {prop_customers:.3f}")
+        print(f"T/N (items sold)     : {prop_inventory:.3f}")
+        print()
+
+        print("Per-customer outcome:")
+        for cid, bid_val in bids:
+            if cid in {x for x, _ in accepted_stage1}:
+                print(f"Customer {cid:>3}: BidPaid:{bid_val:.2f}")
+            else:
+                print(f"Customer {cid:>3}: Incomplete")
+
+        print("\n===== FINANCIALS =====")
+        print(f"Face price × T (target revenue): €{target_revenue:.2f}")
+        print(f"Expected vendor revenue        : €{vendor_revenue_exp:.2f}")
+        print(f"Remaining balance              : €{remaining_balance:+.2f}")
+        return  # nothing more to do
+
     # --- Stage 2 ---------------------------------------------------
     prices_stage2, lambda_star = stage2_pricing(remaining, P, delta1, inventory_left)
 
@@ -152,9 +184,12 @@ def main(argv: List[str] | None = None) -> None:
         elif cid in price_dict:
             price = price_dict[cid]
             prob = acceptance_prob(price, bid_val)
-            if prob == 0.0:
+
+            EPS = 1e-6  # tolerance for floating-point noise
+            if prob < EPS:
                 print(f"Customer {cid:>3}: Incomplete")
-            elif prob == 1.0:
+            elif prob > 1.0 - EPS:
+                # Treat probabilities extremely close to 1 as certain sales
                 print(f"Customer {cid:>3}: Sold:{price:.2f}")
             else:
                 print(f"Customer {cid:>3}: Offer:{price:.2f} (p={prob*100:.0f}%)")
