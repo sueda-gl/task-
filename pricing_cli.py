@@ -79,6 +79,8 @@ def main(argv: List[str] | None = None) -> None:
     group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument("--bids", "-b", type=pathlib.Path, help="CSV/txt file with bids")
     group.add_argument("--random", "-r", type=int, metavar="C", help="Generate C random bids in the legal range (requires --price)")
+    parser.add_argument("--priority", choices=["units", "gap"], default="units", help="Stage-2 relaxation priority (units or gap)")
+
     args = parser.parse_args(argv)
 
     N: int = args.inventory
@@ -146,7 +148,7 @@ def main(argv: List[str] | None = None) -> None:
         return  # nothing more to do
 
     # --- Stage 2 ---------------------------------------------------
-    prices_stage2, lambda_star = stage2_pricing(remaining, P, delta1, inventory_left)
+    prices_stage2, lambda_star = stage2_pricing(remaining, P, delta1, inventory_left, priority=args.priority)
 
     # Build quick lookup tables
     accepted_ids = {cid for cid, _ in accepted_stage1}

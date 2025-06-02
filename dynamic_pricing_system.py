@@ -71,6 +71,7 @@ def deterministic_stage2(
     P: float,
     delta1: float,
     inventory_left: int,
+    priority: str = "units",  # 'units' or 'gap'
 ) -> List[Tuple[int, float]]:
     """Solve Stage-2 exactly with a tiny MILP.
 
@@ -121,52 +122,140 @@ def deterministic_stage2(
     # instead of reverting to prohibitive prices.
     # ------------------------------------------------------------------
     if status != pulp.LpStatusOptimal:
-        # 1st pass infeasible → build relaxed model
-        model_relax = pulp.LpProblem("Stage2_MILP_relax", pulp.LpMaximize)
+        # ---------- LEXICOGRAPHIC RELAXATION ---------------------------------
+        if priority == "units":
+            # ----------------- UNITS-FIRST ----------------------------------
+            # Step 1: maximise number of winners, ignoring revenue balance.
+            model_units = pulp.LpProblem("Stage2_units", pulp.LpMaximize)
 
-        # same variables
-        y2 = {cid: pulp.LpVariable(f"y_{cid}", 0, 1, cat="Binary") for cid in bids}
-        P2 = {
-            cid: pulp.LpVariable(
-                f"P_{cid}", lowBound=0.0, upBound=bids[cid], cat="Continuous"
+            y_u = {cid: pulp.LpVariable(f"y_{cid}", 0, 1, cat="Binary") for cid in bids}
+            P_u = {
+                cid: pulp.LpVariable(
+                    f"P_{cid}", lowBound=0.0, upBound=bids[cid], cat="Continuous"
+                )
+                for cid in bids
+            }
+
+            model_units += pulp.lpSum(y_u.values())  # objective: max units
+            model_units += pulp.lpSum(y_u.values()) <= K
+
+            for cid, B in bids.items():
+                model_units += P_u[cid] <= B * y_u[cid]
+                model_units += P_u[cid] >= 0.0 * y_u[cid]
+
+            status_u = model_units.solve(pulp.PULP_CBC_CMD(msg=False))
+
+            if status_u != pulp.LpStatusOptimal:
+                print("  MILP infeasible in unit-max phase — reverting to prohibitive pricing.")
+                return [(cid, 2 * b) for cid, b in remaining]
+
+            max_units = int(sum(v.value() for v in y_u.values()))
+
+            # Step 2: with units fixed, minimise absolute revenue gap |gap|
+            model_gap = pulp.LpProblem("Stage2_gap", pulp.LpMinimize)
+
+            y_g = {cid: pulp.LpVariable(f"y_{cid}", 0, 1, cat="Binary") for cid in bids}
+            P_g = {
+                cid: pulp.LpVariable(
+                    f"P_{cid}", lowBound=0.0, upBound=bids[cid], cat="Continuous"
+                )
+                for cid in bids
+            }
+            g_pos = pulp.LpVariable("g_pos", lowBound=0.0)
+            g_neg = pulp.LpVariable("g_neg", lowBound=0.0)
+
+            # Objective: minimise |gap|
+            model_gap += g_pos + g_neg
+
+            # Constraints
+            model_gap += pulp.lpSum(y_g.values()) == max_units  # fix unit count
+            model_gap += pulp.lpSum(y_g.values()) <= K          # redundant safety
+
+            model_gap += (
+                pulp.lpSum(P_g.values()) - P * pulp.lpSum(y_g.values()) + g_pos - g_neg == -delta1
             )
-            for cid in bids
-        }
 
-        # residual gap variables (absolute value)
-        g_pos = pulp.LpVariable("g_pos", lowBound=0.0)
-        g_neg = pulp.LpVariable("g_neg", lowBound=0.0)
+            for cid, B in bids.items():
+                model_gap += P_g[cid] <= B * y_g[cid]
+                model_gap += P_g[cid] >= 0.0 * y_g[cid]
 
-        BIG = 1000  # weight to prioritise customers over gap
-        model_relax += BIG * pulp.lpSum(y2.values()) - (g_pos + g_neg)
+            status_g = model_gap.solve(pulp.PULP_CBC_CMD(msg=False))
 
-        # stock limit
-        model_relax += pulp.lpSum(y2.values()) <= K
+            if status_g == pulp.LpStatusOptimal:
+                prices = []
+                for cid, b in remaining:
+                    if y_g[cid].value() > 0.5:
+                        prices.append((cid, P_g[cid].value()))
+                    else:
+                        prices.append((cid, 2 * b))
+                gap_val = g_pos.value() - g_neg.value()
+                print(
+                    f"  Relaxed lexicographic MILP (units-first): residual balance {gap_val:+.2f} after selling {max_units} units."
+                )
+                return prices
 
-        # relaxed revenue equation: Σ P_i − P Σ y_i + g_pos - g_neg = -Δ1
-        model_relax += (pulp.lpSum(P2.values()) - P * pulp.lpSum(y2.values()) + g_pos - g_neg == -delta1)
+            print("  MILP infeasible even after lexicographic relaxation — reverting to prohibitive pricing.")
+            return [(cid, 2 * b) for cid, b in remaining]
 
-        # linking constraints
+        # ------------------ GAP-FIRST ---------------------------------------
+        # Step 1: minimise |gap| ignoring units
+        model_gap1 = pulp.LpProblem("Stage2_gap1", pulp.LpMinimize)
+
+        y_g1 = {cid: pulp.LpVariable(f"y_{cid}", 0, 1, cat="Binary") for cid in bids}
+        P_g1 = {cid: pulp.LpVariable(f"P_{cid}", 0.0, bids[cid]) for cid in bids}
+        g_pos1 = pulp.LpVariable("g_pos1", lowBound=0.0)
+        g_neg1 = pulp.LpVariable("g_neg1", lowBound=0.0)
+
+        model_gap1 += g_pos1 + g_neg1
+        model_gap1 += pulp.lpSum(y_g1.values()) <= K
+        model_gap1 += pulp.lpSum(P_g1.values()) - P * pulp.lpSum(y_g1.values()) + g_pos1 - g_neg1 == -delta1
         for cid, B in bids.items():
-            model_relax += P2[cid] <= B * y2[cid]
-            model_relax += P2[cid] >= 0.0 * y2[cid]
+            model_gap1 += P_g1[cid] <= B * y_g1[cid]
+            model_gap1 += P_g1[cid] >= 0.0 * y_g1[cid]
 
-        status2 = model_relax.solve(pulp.PULP_CBC_CMD(msg=False))
+        status_g1 = model_gap1.solve(pulp.PULP_CBC_CMD(msg=False))
 
-        if status2 == pulp.LpStatusOptimal:
-            # build price list from relaxed solution
+        if status_g1 != pulp.LpStatusOptimal:
+            print("  GAP-first phase1 infeasible — reverting to prohibitive pricing.")
+            return [(cid, 2 * b) for cid, b in remaining]
+
+        best_gap = g_pos1.value() - g_neg1.value()
+
+        # Step 2: maximise units with |gap| ≤ best_gap + tiny_eps
+        eps = 1e-3
+        model_units2 = pulp.LpProblem("Stage2_units2", pulp.LpMaximize)
+        y2 = {cid: pulp.LpVariable(f"y2_{cid}", 0, 1, cat="Binary") for cid in bids}
+        P2v = {cid: pulp.LpVariable(f"P2_{cid}", 0.0, bids[cid]) for cid in bids}
+
+        model_units2 += pulp.lpSum(y2.values())
+        model_units2 += pulp.lpSum(y2.values()) <= K
+        # gap constraints within ± best_gap +/- eps
+        model_units2 += (
+            pulp.lpSum(P2v.values()) - P * pulp.lpSum(y2.values()) >= -delta1 - best_gap - eps
+        )
+        model_units2 += (
+            pulp.lpSum(P2v.values()) - P * pulp.lpSum(y2.values()) <= -delta1 - best_gap + eps
+        )
+
+        for cid, B in bids.items():
+            model_units2 += P2v[cid] <= B * y2[cid]
+            model_units2 += P2v[cid] >= 0.0 * y2[cid]
+
+        status_u2 = model_units2.solve(pulp.PULP_CBC_CMD(msg=False))
+
+        if status_u2 == pulp.LpStatusOptimal:
             prices = []
             for cid, b in remaining:
                 if y2[cid].value() > 0.5:
-                    prices.append((cid, P2[cid].value()))
+                    prices.append((cid, P2v[cid].value()))
                 else:
                     prices.append((cid, 2 * b))
-            gap_val = g_pos.value() - g_neg.value()
-            print(f"  Relaxed MILP: residual balance {gap_val:+.2f} after selling {int(sum(v.value() for v in y2.values()))} units.")
+            print(
+                f"  Relaxed lexicographic MILP (gap-first): residual balance {best_gap:+.2f} with {int(sum(v.value() for v in y2.values()))} units."
+            )
             return prices
 
-        # still infeasible (pathological) → prohibitive prices
-        print("  MILP infeasible even after relaxation — reverting to prohibitive pricing.")
+        print("  MILP gap-first phase2 infeasible — reverting to prohibitive pricing.")
         return [(cid, 2 * b) for cid, b in remaining]
 
     prices = []
@@ -178,7 +267,7 @@ def deterministic_stage2(
     return prices
 
 
-def stage2_pricing(remaining: List[Tuple[int, float]], P: float, delta1: float, inventory_left: int) -> Tuple[List[Tuple[int, float]], float]:
+def stage2_pricing(remaining: List[Tuple[int, float]], P: float, delta1: float, inventory_left: int, priority: str = "units") -> Tuple[List[Tuple[int, float]], float]:
     """
     Stage 2: Optimal personalised pricing (dual decomposition)
 
@@ -246,7 +335,7 @@ def stage2_pricing(remaining: List[Tuple[int, float]], P: float, delta1: float, 
     # NEW: Try deterministic MILP first. It always yields exact balance
     # when mathematically feasible and maximises customers served.
     # ------------------------------------------------------------------
-    prices_det = deterministic_stage2(remaining, P, delta1, inventory_left)
+    prices_det = deterministic_stage2(remaining, P, delta1, inventory_left, priority=priority)
 
     # Deterministic MILP succeeded — use its prices directly.
     return prices_det, float("inf")
