@@ -5,3 +5,4 @@ plotly>=5.15.0
 pulp>=2.7.0 
 pyarrow>=14.0.0
 openpyxl>=3.1.0    
+xlsxwriter
