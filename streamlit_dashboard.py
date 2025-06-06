@@ -368,7 +368,7 @@ def main():
         bids = [(i, float(b)) for i, b in enumerate(user_bids[:num_customers])]
         # face_price, total_inventory, seed remain as user-selectable below
         face_price = st.sidebar.number_input("Face Price ($)", min_value=50, max_value=200, value=100, step=1)
-        total_inventory = st.sidebar.number_input("Total Inventory", min_value=60, max_value=200, value=100, step=1)
+        total_inventory = st.sidebar.number_input("Total Inventory", min_value=50, max_value=200, value=100, step=10)
         st.sidebar.markdown("## 🎲 Simulation Settings")
         seed = st.sidebar.number_input("Random Seed", min_value=1, max_value=100, value=42, step=1)
     elif use_fixed_bids:
@@ -383,7 +383,7 @@ def main():
         seed = 42  # not used, but keep for compatibility
     else:
         face_price = st.sidebar.number_input("Face Price ($)", min_value=50, max_value=200, value=100, step=1)
-        total_inventory = st.sidebar.number_input("Total Inventory", min_value=60, max_value=200, value=100, step=1)
+        total_inventory = st.sidebar.number_input("Total Inventory", min_value=50, max_value=200, value=100, step=10)
         num_customers = st.sidebar.number_input("Number of Customers", min_value=50, max_value=300, value=150, step=1)
         st.sidebar.markdown("## 🎲 Simulation Settings")
         seed = st.sidebar.number_input("Random Seed", min_value=1, max_value=100, value=42, step=1)
