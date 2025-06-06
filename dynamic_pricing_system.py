@@ -1,10 +1,20 @@
 import numpy as np
+import os
+import shutil
+import sys
+
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    system_cbc = shutil.which('cbc')
+    if system_cbc:
+        os.environ['PULP_CBC_PATH'] = system_cbc
+        print(f"Set PULP_CBC_PATH to {system_cbc}")
+    else:
+        print("WARNING: System-wide CBC not found. PuLP will error if called.")
+
 import pulp  # open-source MILP solver (CBC bundled)
 from typing import List, Tuple, Dict
 import bisect
-import sys
-import os
-import shutil
+
 
 # --- PyInstaller PuLP CBC Solver Path Fix ---
 CBC_SOLVER = None
@@ -21,7 +31,12 @@ else:
     CBC_SOLVER = pulp.PULP_CBC_CMD(msg=False)
 # --- End PyInstaller PuLP CBC Solver Path Fix ---
 
-def stage1_allocation(bids: List[Tuple[int, float]], P: float, N: int) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]], int, float]:
+def stage1_allocation(
+    bids: List[Tuple[int, float]],
+    P: float,
+    N: int,
+    strict_boundaries: bool = True,
+) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]], int, float]:
     """
     Stage 1: Bucket-based allocation
     
@@ -29,6 +44,7 @@ def stage1_allocation(bids: List[Tuple[int, float]], P: float, N: int) -> Tuple[
         bids: List of (customer_id, bid_value) tuples
         P: Face price
         N: Total inventory (must be divisible by 10)
+        strict_boundaries: bool to choose between strict and inclusive bucket handling
         
     Returns:
         accepted_stage1: List of accepted (customer_id, bid_value)
@@ -40,9 +56,15 @@ def stage1_allocation(bids: List[Tuple[int, float]], P: float, N: int) -> Tuple[
     if N % 10 != 0:
         raise ValueError("N must be divisible by 10")
     
-    # Express lower & upper bounds of the 10 open intervals (strict inequalities)
-    lower = [0.51, 0.61, 0.71, 0.81, 0.91, 1.01, 1.11, 1.21, 1.31, 1.41]
-    upper = [0.60, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30, 1.40, 1.50]
+    # Define bucket boundaries depending on boundary strictness
+    if strict_boundaries:
+        # 1 % gaps – pure open intervals
+        lower = [0.51, 0.61, 0.71, 0.81, 0.91, 1.01, 1.11, 1.21, 1.31, 1.41]
+        upper = [0.60, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30, 1.40, 1.50]
+    else:
+        # Contiguous half-open bands
+        lower = [0.51, 0.60, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30, 1.40]
+        upper = [0.60, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30, 1.40, 1.50]
 
     bucket_capacity = N // 10
 
@@ -53,14 +75,23 @@ def stage1_allocation(bids: List[Tuple[int, float]], P: float, N: int) -> Tuple[
     for customer_id, bid in bids:
         ratio = bid / P
 
-        # Quick reject if outside global bounds (open)
-        if not (0.51 < ratio < 1.50):
-            continue
+        # Global admissible range gate
+        if strict_boundaries:
+            if not (0.51 < ratio < 1.50):
+                continue
+        else:
+            if not (0.51 <= ratio <= 1.50):
+                continue
 
-        # Locate candidate bucket via bisect; then confirm it satisfies open interval
-        idx = bisect.bisect_right(lower, ratio) - 1  # candidate bucket index
-        if 0 <= idx < 10 and lower[idx] < ratio < upper[idx]:
-            buckets[idx].append((customer_id, bid))
+        if strict_boundaries:
+            # Locate candidate bucket via bisect on lower bounds (gapped)
+            idx = bisect.bisect_right(lower, ratio) - 1
+            if 0 <= idx < 10 and lower[idx] < ratio < upper[idx]:
+                buckets[idx].append((customer_id, bid))
+        else:
+            idx = bisect.bisect_left(upper, ratio)
+            if 0 <= idx < 10 and lower[idx] <= ratio <= upper[idx]:
+                buckets[idx].append((customer_id, bid))
     
     # Sort each bucket by bid value (descending) and accept top bucket_capacity
     accepted_stage1 = []

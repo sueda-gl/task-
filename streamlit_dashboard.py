@@ -389,6 +389,15 @@ def main():
         seed = st.sidebar.number_input("Random Seed", min_value=1, max_value=100, value=42, step=1)
         bids = generate_customer_bids(num_customers, face_price, seed)
     
+    st.sidebar.markdown("## ⚙️ Boundary Handling")
+    boundary_mode = st.sidebar.radio(
+        "Bucket boundaries:",
+        options=["Strict gaps", "Inclusive"],
+        index=0,
+        key="boundary_mode",
+    )
+    strict_flag = boundary_mode == "Strict gaps"
+    
     st.sidebar.markdown("## ⚙️ Optimiser Priority")
     priority_mode = st.sidebar.radio(
         "When perfect balance is impossible, optimise for…",
@@ -404,7 +413,9 @@ def main():
         if user_bids is None and not use_fixed_bids:
             bids = generate_customer_bids(num_customers, face_price, seed)
         # Stage 1
-        accepted_stage1, remaining, stage1_units, delta1 = stage1_allocation(bids, face_price, total_inventory)
+        accepted_stage1, remaining, stage1_units, delta1 = stage1_allocation(
+            bids, face_price, total_inventory, strict_boundaries=strict_flag
+        )
         # Stage 2
         inventory_left = total_inventory - stage1_units
         prices_stage2, lambda_star = stage2_pricing(remaining, face_price, delta1, inventory_left, priority=priority_flag)
