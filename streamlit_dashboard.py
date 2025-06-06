@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
 from dynamic_pricing_system import stage1_allocation, stage2_pricing, simulate_stage2_outcomes
+import io
 
 # Page configuration
 st.set_page_config(
@@ -339,14 +340,54 @@ def main():
     
     # Sidebar controls
     st.sidebar.markdown("## 🎛️ System Parameters")
-    
-    face_price = st.sidebar.slider("Face Price ($)", 50, 200, 100, 5)
-    total_inventory = st.sidebar.selectbox("Total Inventory", [50, 100, 150, 200], index=1)
-    num_customers = st.sidebar.slider("Number of Customers", 50, 300, 150, 10)
-    
-    st.sidebar.markdown("## 🎲 Simulation Settings")
-    seed = st.sidebar.slider("Random Seed", 1, 100, 42)
-    run_simulation = st.sidebar.checkbox("Run Monte Carlo Simulation", value=True)
+
+    uploaded_file = st.sidebar.file_uploader("Upload your bids file (CSV or Excel)", type=["csv", "xlsx"])
+    user_bids = None
+    if uploaded_file is not None:
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+        # Assume the bids are in the second column or named 'Initial Bid'
+        if 'Initial Bid' in df.columns:
+            user_bids = df['Initial Bid'].tolist()
+        else:
+            user_bids = df.iloc[:, 1].tolist()  # fallback: use second column
+
+    use_fixed_bids = st.sidebar.checkbox("Use Professor's Test Bids", value=False)
+
+    # Fixed input bids from user
+    fixed_bids = [
+        151, 97, 70, 124, 81, 140, 158, 165, 155, 162, 144, 168, 59, 73, 72, 132, 145, 85, 117, 74, 95, 126, 163, 125, 143, 65, 89, 98, 68, 105, 144, 160, 139, 97, 94, 100, 153, 128, 164, 122, 148, 88, 138, 149, 130, 95, 62, 134, 121, 142, 94, 144, 132, 75, 75, 141, 68, 110, 83, 82, 93, 130, 132, 170, 161, 150, 134, 96, 118, 115, 117, 129, 163, 76, 100, 165, 153, 116, 125, 81, 86, 121, 61, 77, 130, 159, 73, 104, 101, 170, 66
+    ]
+
+    if user_bids is not None:
+        # Add customer count selection
+        max_customers = len(user_bids)
+        num_customers = st.sidebar.number_input("Number of Customers", min_value=1, max_value=max_customers, value=max_customers, step=1)
+        bids = [(i, float(b)) for i, b in enumerate(user_bids[:num_customers])]
+        # face_price, total_inventory, seed remain as user-selectable below
+        face_price = st.sidebar.number_input("Face Price ($)", min_value=50, max_value=200, value=100, step=1)
+        total_inventory = st.sidebar.number_input("Total Inventory", min_value=60, max_value=200, value=100, step=1)
+        st.sidebar.markdown("## 🎲 Simulation Settings")
+        seed = st.sidebar.number_input("Random Seed", min_value=1, max_value=100, value=42, step=1)
+    elif use_fixed_bids:
+        face_price = 116
+        total_inventory = 60
+        bids = [(i, float(b)) for i, b in enumerate(fixed_bids)]
+        num_customers = len(bids)
+        # Show parameters as static text
+        st.sidebar.markdown(f"**Face Price:** {face_price}")
+        st.sidebar.markdown(f"**Total Inventory:** {total_inventory}")
+        st.sidebar.markdown(f"**Number of Customers:** {num_customers}")
+        seed = 42  # not used, but keep for compatibility
+    else:
+        face_price = st.sidebar.number_input("Face Price ($)", min_value=50, max_value=200, value=100, step=1)
+        total_inventory = st.sidebar.number_input("Total Inventory", min_value=60, max_value=200, value=100, step=1)
+        num_customers = st.sidebar.number_input("Number of Customers", min_value=50, max_value=300, value=150, step=1)
+        st.sidebar.markdown("## 🎲 Simulation Settings")
+        seed = st.sidebar.number_input("Random Seed", min_value=1, max_value=100, value=42, step=1)
+        bids = generate_customer_bids(num_customers, face_price, seed)
     
     st.sidebar.markdown("## ⚙️ Optimiser Priority")
     priority_mode = st.sidebar.radio(
@@ -359,11 +400,11 @@ def main():
     
     # Generate data
     with st.spinner("🔄 Running pricing optimization..."):
-        bids = generate_customer_bids(num_customers, face_price, seed)
-        
+        # Only generate random bids if not using uploaded or fixed bids
+        if user_bids is None and not use_fixed_bids:
+            bids = generate_customer_bids(num_customers, face_price, seed)
         # Stage 1
         accepted_stage1, remaining, stage1_units, delta1 = stage1_allocation(bids, face_price, total_inventory)
-        
         # Stage 2
         inventory_left = total_inventory - stage1_units
         prices_stage2, lambda_star = stage2_pricing(remaining, face_price, delta1, inventory_left, priority=priority_flag)
@@ -533,6 +574,40 @@ def main():
         else:
             st.info("🙅‍♂️ No customers left for Stage 2.")
     
+    # --- NEW: Show all customer outcomes as a table (for professor) ---
+    st.markdown("#### Final Customer Outcomes Table")
+    outcome_tbl = []
+    # Build lookup for Stage 1 and Stage 2
+    accepted_stage1_ids = {cid for cid, _ in accepted_stage1}
+    price_dict_stage2 = {cid: p for cid, p in prices_stage2} if prices_stage2 else {}
+    for cid, bid in bids:
+        if cid in accepted_stage1_ids:
+            outcome = f"{bid:.2f}"  # Stage 1: price is the bid
+        elif cid in price_dict_stage2:
+            price = price_dict_stage2[cid]
+            # Acceptance probability for Stage 2
+            if price <= bid:
+                outcome = f"{price:.2f}"
+            else:
+                outcome = "Incomplete"
+        else:
+            outcome = "Incomplete"
+        outcome_tbl.append({"Customer Index": cid, "Initial Bid": f"{bid:.2f}", "Outcome": outcome})
+    st.dataframe(pd.DataFrame(outcome_tbl))
+
+    # --- Export to Excel button ---
+    output_df = pd.DataFrame(outcome_tbl)
+    towrite = io.BytesIO()
+    with pd.ExcelWriter(towrite, engine='xlsxwriter') as writer:
+        output_df.to_excel(writer, index=False, sheet_name='Outcomes')
+    towrite.seek(0)
+    st.download_button(
+        label="📥 Export Outcomes Table to Excel",
+        data=towrite,
+        file_name="customer_outcomes.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
     # Revenue Analysis
     st.markdown('<div class="stage-header">💰 Revenue Analysis</div>', unsafe_allow_html=True)
     
@@ -540,7 +615,7 @@ def main():
     st.plotly_chart(revenue_fig, use_container_width=True)
     
     # Monte Carlo Simulation
-    if run_simulation and prices_stage2:
+    if prices_stage2:
         st.markdown('<div class="stage-header">🎲 Monte Carlo Risk Analysis</div>', unsafe_allow_html=True)
         
         with st.spinner("Running Monte Carlo simulation..."):
